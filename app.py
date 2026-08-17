@@ -164,19 +164,36 @@ def fetch_media_id_by_shortcode(shortcode):
 
 
 def subscribe_webhook():
-    if not EFFECTIVE_IG_ID or not ACCESS_TOKEN:
-        log.warning("Skipping webhook subscribe: missing IG_USER_ID/IG_BUSINESS_ID or token")
+    if not ACCESS_TOKEN:
+        log.warning("Skipping webhook subscribe: missing access token")
         return
-    url = f"https://graph.instagram.com/v22.0/{EFFECTIVE_IG_ID}/subscribed_apps"
-    try:
-        resp = requests.post(
-            url,
-            params={"subscribed_fields": "comments", "access_token": ACCESS_TOKEN},
-            timeout=15,
-        )
-        log.info("SUBSCRIBE WEBHOOK -> %s %s", resp.status_code, resp.text)
-    except requests.RequestException as e:
-        log.warning("SUBSCRIBE WEBHOOK failed: %s", e)
+
+    # "me" resolves to whatever account the token itself belongs to, which
+    # sidesteps ID-mismatch issues if IG_USER_ID/IG_BUSINESS_ID env vars
+    # don't exactly match the token's underlying account id.
+    candidate_ids = ["me"]
+    if EFFECTIVE_IG_ID:
+        candidate_ids.append(EFFECTIVE_IG_ID)
+
+    for ig_id in candidate_ids:
+        url = f"https://graph.instagram.com/v22.0/{ig_id}/subscribed_apps"
+        try:
+            resp = requests.post(
+                url,
+                params={"subscribed_fields": "comments", "access_token": ACCESS_TOKEN},
+                timeout=15,
+            )
+            log.info("SUBSCRIBE WEBHOOK (id=%s) -> %s %s", ig_id, resp.status_code, resp.text)
+            if resp.status_code == 200:
+                return
+        except requests.RequestException as e:
+            log.warning("SUBSCRIBE WEBHOOK (id=%s) failed: %s", ig_id, e)
+
+    log.warning(
+        "SUBSCRIBE WEBHOOK failed on all candidate IDs. Check that PAGE_ACCESS_TOKEN "
+        "has instagram_business_manage_messages/comments scopes and that IG_USER_ID "
+        "matches the token's actual account (compare via GET /me?access_token=...)."
+    )
 
 
 def exchange_for_long_lived_token():
@@ -443,12 +460,21 @@ def run_telegram_bot():
     """Runs polling with basic retry so a Conflict error doesn't crash the process."""
     application = build_telegram_app()
     while True:
+        # Python 3.12+/3.14 no longer auto-creates an event loop in the main
+        # thread, so we must create and set one explicitly before run_polling().
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
             application.run_polling(drop_pending_updates=True, close_loop=False)
             break  # run_polling returned normally (e.g. on shutdown)
         except Exception as e:
             log.warning("Telegram polling error: %s -- retrying in 10s", e)
             time.sleep(10)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
