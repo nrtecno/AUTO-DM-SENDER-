@@ -1,91 +1,111 @@
-import os, re, json, requests
-from dotenv import load_dotenv
+import os, re, json, requests, threading, asyncio
 from flask import Flask, request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-import threading
-
-# Env file se token lega, code se nahi
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
-IG_BUSINESS_ID = os.getenv("IG_BUSINESS_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "auto123")
 
 app = Flask(__name__)
-DATA_FILE = "data.json"
-user_states = {}
 
-def load_data():
-    if not os.path.exists(DATA_FILE): return {}
-    with open(DATA_FILE, 'r') as f: return json.load(f)
-def save_data(data):
-    with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2)
+# --- FIX: Env ko safe tarike se read karo ---
+def get_env(key):
+    val = os.environ.get(key, "")
+    # Render kabhi-kabhi " " ke sath token deta hai, usko saaf karo
+    return val.strip().strip('"').strip("'").strip()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Reel ka link bhejo:")
-    user_states[update.effective_user.id] = {"step": "reel_link"}
+BOT_TOKEN = get_env("BOT_TOKEN")
+PAGE_ACCESS_TOKEN = get_env("PAGE_ACCESS_TOKEN")
+IG_BUSINESS_ID = get_env("IG_BUSINESS_ID")
+VERIFY_TOKEN = get_env("VERIFY_TOKEN") or "auto123"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    state = user_states.get(user_id, {})
-    data = load_data()
-    chat_data = data.get(str(user_id), {})
+print(f"--- ENV CHECK ---")
+print(f"BOT_TOKEN found: {bool(BOT_TOKEN)} len: {len(BOT_TOKEN) if BOT_TOKEN else 0}")
+print(f"PAGE_TOKEN found: {bool(PAGE_ACCESS_TOKEN)}")
+print(f"VERIFY_TOKEN: {VERIFY_TOKEN}")
 
-    if state.get("step") == "reel_link":
-        match = re.search(r'/reel/([^/]+)/', text)
-        shortcode = match.group(1) if match else None
-        chat_data["shortcode"] = shortcode
-        save_data({**data, str(user_id): chat_data})
-        keyboard = [[InlineKeyboardButton("🌍 All Comments", callback_data="kw_all")]]
-        await update.message.reply_text("Keyword type select karo:", reply_markup=InlineKeyboardMarkup(keyboard))
-        user_states[user_id]["step"] = "kw_type"
-
-    elif state.get("step") == "dm_link":
-        chat_data["dm_link"] = text # Ek hi link, DM aur Button dono ke liye
-        save_data({**data, str(user_id): chat_data})
-        await update.message.reply_text("Button Name bhejo - skip ke liye `skip`:")
-        user_states[user_id]["step"] = "btn_name"
-
-    elif state.get("step") == "btn_name":
-        chat_data["button_name"] = None if text.lower() == 'skip' else text
-        save_data({**data, str(user_id): chat_data})
-        keyboard = [[InlineKeyboardButton("✅ Followers Only", callback_data="follow_on")],
-                    [InlineKeyboardButton("❌ Sabko DM", callback_data="follow_off")]]
-        await update.message.reply_text("DM kisko bheju?", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = load_data()
-    chat_data = data.get(str(user_id), {})
-    if query.data == "kw_all":
-        chat_data["keyword_type"] = "all"
-        save_data({**data, str(user_id): chat_data})
-        await query.message.reply_text("✅ All selected.\nAb DM LINK bhejo (Yahi Button URL bhi hai):")
-        user_states[user_id] = {"step": "dm_link"}
-    elif query.data.startswith("follow_"):
-        chat_data["follow_only"] = True if query.data == "follow_on" else False
-        save_data({**data, str(user_id): chat_data})
-        await query.message.reply_text(f"✅ Bot Active!\nFollow Only: {chat_data['follow_only']}")
+@app.route('/')
+def home():
+    return "Bot Live Hai"
 
 @app.route('/webhook', methods=['GET','POST'])
 def webhook():
     if request.method == 'GET':
-        if request.args.get('hub.verify_token') == VERIFY_TOKEN: return request.args.get('hub.challenge')
+        if request.args.get('hub.verify_token') == VERIFY_TOKEN:
+            return request.args.get('hub.challenge')
         return "Fail", 403
-    # ... (DM/Comment logic same as before)
+    print("Webhook hit:", request.json)
     return "OK", 200
 
-def run_flask(): app.run(host='0.0.0.0', port=5000)
+# Telegram Bot - Alag thread me, crash nahi karega
+def run_telegram():
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        print(f"CRITICAL: BOT_TOKEN galat hai. Render me check kar. Value mili: '{BOT_TOKEN[:10]}...'")
+        return
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+        from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+        user_states = {}
+        def load_data():
+            if not os.path.exists("data.json"): return {}
+            with open("data.json", 'r') as f: return json.load(f)
+        def save_data(d):
+            with open("data.json", 'w') as f: json.dump(d, f, indent=2)
+
+        async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_states[update.effective_user.id] = {"step": "reel_link"}
+            await update.message.reply_text("Reel ka link bhejo:")
+
+        async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            uid = update.effective_user.id
+            txt = update.message.text.strip()
+            step = user_states.get(uid, {}).get("step")
+            data = load_data()
+            cfg = data.get(str(uid), {})
+            if step == "reel_link":
+                m = re.search(r'/reel/([^/]+)/', txt)
+                cfg["shortcode"] = m.group(1) if m else "test"
+                save_data({**data, str(uid): cfg})
+                kb = [[InlineKeyboardButton("🌍 All Comments", callback_data="kw_all")]]
+                await update.message.reply_text("Keyword:", reply_markup=InlineKeyboardMarkup(kb))
+            elif step == "dm_link":
+                cfg["dm_link"] = txt # FIX: Ek hi link DM + Button ke liye
+                save_data({**data, str(uid): cfg})
+                await update.message.reply_text("Button Name bhejo (skip = skip):")
+                user_states[uid] = {"step": "btn_name"}
+            elif step == "btn_name":
+                cfg["button_name"] = None if txt.lower()=="skip" else txt
+                save_data({**data, str(uid): cfg})
+                kb = [[InlineKeyboardButton("✅ Follow Only ON", callback_data="follow_on")],[InlineKeyboardButton("❌ Sabko DM", callback_data="follow_off")]]
+                await update.message.reply_text("Follow check?", reply_markup=InlineKeyboardMarkup(kb))
+
+        async def handle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            q = update.callback_query
+            await q.answer()
+            uid = q.from_user.id
+            data = load_data()
+            cfg = data.get(str(uid), {})
+            if q.data == "kw_all":
+                await q.message.reply_text("✅ All Selected\nAb DM LINK bhejo (Yahi Button URL hai):")
+                user_states[uid] = {"step": "dm_link"}
+            else:
+                cfg["follow_only"] = q.data=="follow_on"
+                save_data({**data, str(uid): cfg})
+                await q.message.reply_text(f"✅ Bot Active! Follow Only: {cfg['follow_only']}")
+
+        async def main():
+            app_tg = Application.builder().token(BOT_TOKEN).build()
+            app_tg.add_handler(CommandHandler("start", start))
+            app_tg.add_handler(CallbackQueryHandler(handle_cb))
+            app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+            await app_tg.initialize()
+            await app_tg.start()
+            print("Telegram Polling Started")
+            await app_tg.updater.start_polling()
+            await asyncio.Event().wait()
+
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Telegram Thread Error: {e}")
+
+threading.Thread(target=run_telegram, daemon=True).start()
 
 if __name__ == '__main__':
-    threading.Thread(target=run_flask).start()
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.run_polling()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
