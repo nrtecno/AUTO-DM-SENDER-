@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import time
 import logging
@@ -9,7 +10,7 @@ import asyncio
 import requests
 from flask import Flask, request, jsonify
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,12 +41,13 @@ IG_BUSINESS_ID = os.environ.get("IG_BUSINESS_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "auto123")
 
 # Optional, only needed for long-lived token exchange/refresh.
-# Add this on Render if you want auto-refresh: IG_APP_SECRET
 IG_APP_SECRET = os.environ.get("IG_APP_SECRET", "")
 
-# Optional: set to "true" on Render once you're ready for production media_id
-# matching. Defaults to soft/off so testing DMs go through regardless of match.
-STRICT_MEDIA_MATCH = os.environ.get("STRICT_MEDIA_MATCH", "false").lower() == "true"
+# If true, comments only match a config when media_id matches exactly.
+# With multiple reels tracked at once, this should normally stay true.
+# Configs saved without a resolvable media_id act as a catch-all fallback
+# regardless of this setting (so testing still works even if lookup failed).
+STRICT_MEDIA_MATCH = os.environ.get("STRICT_MEDIA_MATCH", "true").lower() == "true"
 
 EFFECTIVE_IG_ID = IG_USER_ID or IG_BUSINESS_ID
 
@@ -55,8 +57,18 @@ ACCESS_TOKEN = PAGE_ACCESS_TOKEN
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 
 # ----------------------------------------------------------------------------
-# DATA STORE (simple json file -- ephemeral on Render, fine for testing)
+# DATA STORE
 # ----------------------------------------------------------------------------
+# Structure (supports multiple reels per admin):
+# {
+#   "<admin_telegram_id>": {
+#     "<shortcode>": {
+#         "shortcode", "reel_url", "media_id", "keyword_type",
+#         "dm_link", "button_name", "follow_only"
+#     },
+#     ...
+#   }
+# }
 _data_lock = threading.Lock()
 
 
@@ -78,14 +90,25 @@ def save_data(data):
 
 
 # ----------------------------------------------------------------------------
+# TELEGRAM NOTIFY HELPER (plain HTTP, works from any thread, no asyncio needed)
+# ----------------------------------------------------------------------------
+def notify_admin(text: str):
+    if not BOT_TOKEN or not ADMIN_TELEGRAM_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": ADMIN_TELEGRAM_ID, "text": text},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning("notify_admin failed: %s", e)
+
+
+# ----------------------------------------------------------------------------
 # INSTAGRAM GRAPH API HELPERS
 # ----------------------------------------------------------------------------
 def graph_post_with_fallback(path_suffix, payload):
-    """
-    Tries graph.instagram.com first, then graph.facebook.com as fallback.
-    path_suffix example: "{comment_id}/replies" or "{EFFECTIVE_IG_ID}/messages"
-    Returns (success: bool, response_json_or_text, url_used)
-    """
     urls = [
         f"https://graph.instagram.com/v22.0/{path_suffix}",
         f"https://graph.facebook.com/v19.0/{path_suffix}",
@@ -117,6 +140,8 @@ def graph_post_with_fallback(path_suffix, payload):
 def reply_to_comment(comment_id, message_text):
     ok, body, url = graph_post_with_fallback(f"{comment_id}/replies", {"message": message_text})
     log.info("REPLY STATUS - comment_id=%s ok=%s url=%s body=%s", comment_id, ok, url, body)
+    if not ok:
+        notify_admin(f"⚠️ Comment reply FAILED for comment_id={comment_id}\n{body}")
     return ok
 
 
@@ -143,23 +168,37 @@ def send_dm(recipient_id, config):
     payload = {"recipient": {"id": recipient_id}, "message": message}
     ok, body, url = graph_post_with_fallback(f"{EFFECTIVE_IG_ID}/messages", payload)
     log.info("DM STATUS - recipient=%s ok=%s url=%s body=%s", recipient_id, ok, url, body)
+
+    if ok:
+        notify_admin(f"✅ DM sent to {recipient_id} (reel: {config.get('shortcode')})")
+    else:
+        notify_admin(f"❌ DM FAILED to {recipient_id} (reel: {config.get('shortcode')})\n{body}")
     return ok
 
 
-def fetch_media_id_by_shortcode(shortcode):
-    """Look up media id matching a shortcode from the account's recent media."""
+def fetch_media_id_by_shortcode(shortcode, max_pages=10):
+    """Look up media id matching a shortcode, paging through all recent media."""
     url = f"https://graph.instagram.com/v22.0/{IG_USER_ID}/media"
     params = {"fields": "id,shortcode", "limit": 100, "access_token": ACCESS_TOKEN}
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        log.warning("fetch_media_id_by_shortcode failed: %s", e)
-        return None
 
-    for item in data.get("data", []):
-        if item.get("shortcode") == shortcode:
-            return item.get("id")
+    for _ in range(max_pages):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            log.warning("fetch_media_id_by_shortcode failed: %s", e)
+            return None
+
+        for item in data.get("data", []):
+            if item.get("shortcode") == shortcode:
+                return item.get("id")
+
+        next_url = data.get("paging", {}).get("next")
+        if not next_url:
+            break
+        url = next_url
+        params = None  # next_url already contains all query params
+
     return None
 
 
@@ -168,9 +207,6 @@ def subscribe_webhook():
         log.warning("Skipping webhook subscribe: missing access token")
         return
 
-    # "me" resolves to whatever account the token itself belongs to, which
-    # sidesteps ID-mismatch issues if IG_USER_ID/IG_BUSINESS_ID env vars
-    # don't exactly match the token's underlying account id.
     candidate_ids = ["me"]
     if EFFECTIVE_IG_ID:
         candidate_ids.append(EFFECTIVE_IG_ID)
@@ -194,6 +230,7 @@ def subscribe_webhook():
         "has instagram_business_manage_messages/comments scopes and that IG_USER_ID "
         "matches the token's actual account (compare via GET /me?access_token=...)."
     )
+    notify_admin("⚠️ Webhook subscribe failed on startup. DMs/replies will NOT work until this is fixed. Check Render logs.")
 
 
 def exchange_for_long_lived_token():
@@ -214,9 +251,14 @@ def exchange_for_long_lived_token():
             ACCESS_TOKEN = data["access_token"]
             expires_in = data.get("expires_in", "?")
             log.info("TOKEN EXCHANGE OK - new long-lived token active in-memory, expires_in=%s sec", expires_in)
-            log.info("IMPORTANT: update PAGE_ACCESS_TOKEN on Render with this new token so it survives restarts.")
+            notify_admin(
+                f"🔑 Instagram token refreshed (expires_in={expires_in}s). "
+                "Update PAGE_ACCESS_TOKEN on Render with this new value so it survives restarts "
+                "(check Render logs for the exact token, it's not sent here for safety)."
+            )
         else:
             log.warning("TOKEN EXCHANGE FAILED -> %s %s", resp.status_code, data)
+            notify_admin(f"⚠️ Instagram token refresh FAILED: {data}")
     except (requests.RequestException, ValueError) as e:
         log.warning("TOKEN EXCHANGE exception: %s", e)
 
@@ -255,7 +297,7 @@ def webhook_receive():
     body = request.get_json(silent=True) or {}
     log.info("WEBHOOK AAYA - raw=%s", json.dumps(body)[:2000])
 
-    configs = load_data()
+    all_data = load_data()
 
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
@@ -281,23 +323,35 @@ def webhook_receive():
                 continue
 
             matched_config = None
-            for admin_id, config in configs.items():
-                if config.get("keyword_type") != "all":
-                    continue  # only "all comments" mode supported currently
 
-                if STRICT_MEDIA_MATCH:
-                    cfg_media_id = config.get("media_id")
-                    if cfg_media_id and media_id and cfg_media_id != media_id:
+            # Pass 1: exact media_id match across every admin's saved automations.
+            for admin_id, automations in all_data.items():
+                for shortcode, config in automations.items():
+                    if config.get("keyword_type") != "all":
                         continue
+                    if config.get("media_id") and media_id and config["media_id"] == media_id:
+                        matched_config = config
+                        break
+                if matched_config:
+                    break
 
-                matched_config = config
-                break
+            # Pass 2: catch-all fallback for configs where media_id lookup failed,
+            # only if nothing matched exactly and strict mode allows it.
+            if not matched_config and not STRICT_MEDIA_MATCH:
+                for admin_id, automations in all_data.items():
+                    for shortcode, config in automations.items():
+                        if config.get("keyword_type") == "all" and not config.get("media_id"):
+                            matched_config = config
+                            break
+                    if matched_config:
+                        break
 
             if not matched_config:
-                log.info("NO MATCH - no active config for this comment")
+                log.info("NO MATCH - no active config for this comment (media_id=%s)", media_id)
                 continue
 
-            log.info("MATCHED - dm_link=%s button_name=%s", matched_config.get("dm_link"), matched_config.get("button_name"))
+            log.info("MATCHED - shortcode=%s dm_link=%s button_name=%s",
+                      matched_config.get("shortcode"), matched_config.get("dm_link"), matched_config.get("button_name"))
 
             reply_to_comment(comment_id, "DM check karo, link bhej diya 🚀")
             send_dm(commenter_id, matched_config)
@@ -309,6 +363,7 @@ def webhook_receive():
 # TELEGRAM BOT (admin-only setup flow)
 # ----------------------------------------------------------------------------
 WAITING_REEL_LINK, WAITING_KEYWORD, WAITING_DM_LINK, WAITING_BUTTON_NAME, WAITING_FOLLOW_ONLY = range(5)
+WAITING_RESTORE_FILE = 100
 
 
 def is_admin(user_id) -> bool:
@@ -321,7 +376,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "Reel ka link bhejo (jaise instagram.com/reel/XXXXXXX/)"
+        "Naye reel ka link bhejo (jaise instagram.com/reel/XXXXXXX/)\n\n"
+        "Tip: /list se saari active automations dekh sakte ho, /remove se hata sakte ho."
     )
     return WAITING_REEL_LINK
 
@@ -334,7 +390,7 @@ async def receive_reel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_REEL_LINK
 
     shortcode = match.group(1)
-    await update.message.reply_text("Media ID fetch kar raha hoon...")
+    await update.message.reply_text("Media ID fetch kar raha hoon (saari reels check kar raha hoon, thoda time lag sakta hai)...")
     media_id = fetch_media_id_by_shortcode(shortcode)
 
     context.user_data["shortcode"] = shortcode
@@ -345,8 +401,9 @@ async def receive_reel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Media ID mil gaya: {media_id}")
     else:
         await update.message.reply_text(
-            "Media ID nahi mila (ho sakta hai token ya permission issue ho). "
-            "Testing ke liye aage badh sakte ho, media match strict nahi hai."
+            "Media ID nahi mila (bahut purani reel ho sakti hai, ya token/permission issue). "
+            "Agar STRICT_MEDIA_MATCH=false hai to ye reel catch-all ki tarah kaam karegi -- "
+            "matlab har naya comment (kisi bhi reel pe) is config se match ho sakta hai. Aage badh sakte ho."
         )
 
     keyboard = InlineKeyboardMarkup(
@@ -383,8 +440,8 @@ async def receive_button_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
     )
     await update.message.reply_text(
-        "Follow Only ON/OFF? (Instagram API abhi follow-check support nahi karta, "
-        "ON select karoge to bhi OFF hi use hoga)",
+        "Follow Only ON/OFF? (Instagram API abhi follow-check support NAHI karta -- "
+        "ye ek platform limitation hai, ON select karoge to bhi OFF hi use hoga)",
         reply_markup=keyboard,
     )
     return WAITING_FOLLOW_ONLY
@@ -396,13 +453,14 @@ async def receive_follow_only(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data["follow_only"] = False  # forced off, API limitation
     if query.data == "follow_on":
-        await query.edit_message_text("Follow Only: OFF (ON abhi supported nahi hai) ✅")
+        await query.edit_message_text("Follow Only: OFF (ON abhi Instagram API mein supported nahi hai) ✅")
     else:
         await query.edit_message_text("Follow Only: OFF ✅")
 
     admin_id = str(update.effective_user.id)
+    shortcode = context.user_data.get("shortcode")
     config = {
-        "shortcode": context.user_data.get("shortcode"),
+        "shortcode": shortcode,
         "reel_url": context.user_data.get("reel_url"),
         "media_id": context.user_data.get("media_id"),
         "keyword_type": context.user_data.get("keyword_type", "all"),
@@ -412,14 +470,16 @@ async def receive_follow_only(update: Update, context: ContextTypes.DEFAULT_TYPE
     }
 
     data = load_data()
-    data[admin_id] = config
+    data.setdefault(admin_id, {})[shortcode] = config
     save_data(data)
 
+    total = len(data[admin_id])
     await query.message.reply_text(
-        "Setup ho gaya! Ab is reel pe koi bhi comment karega to reply + DM chala jayega.\n\n"
+        "Setup ho gaya! Is reel pe koi bhi comment karega to reply + DM chala jayega.\n\n"
         f"Reel: {config['reel_url']}\n"
         f"DM link: {config['dm_link']}\n"
-        f"Button: {config['button_name']}"
+        f"Button: {config['button_name']}\n\n"
+        f"Total active automations: {total}. /list se dekh sakte ho."
     )
     return ConversationHandler.END
 
@@ -429,10 +489,113 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def list_automations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    admin_id = str(update.effective_user.id)
+    data = load_data()
+    automations = data.get(admin_id, {})
+
+    if not automations:
+        await update.message.reply_text("Koi active automation nahi hai. /start se naya banao.")
+        return
+
+    lines = ["📋 Active automations:\n"]
+    for shortcode, config in automations.items():
+        lines.append(
+            f"• {shortcode} -- {config.get('reel_url')}\n"
+            f"  DM: {config.get('dm_link')} | Button: {config.get('button_name')}\n"
+            f"  media_id: {config.get('media_id') or 'NOT FOUND (catch-all)'}"
+        )
+    lines.append("\nHatane ke liye /remove use karo.")
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    admin_id = str(update.effective_user.id)
+    data = load_data()
+    automations = data.get(admin_id, {})
+
+    if not automations:
+        await update.message.reply_text("Koi active automation nahi hai hatane ke liye.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton(f"❌ {shortcode}", callback_data=f"rm_{shortcode}")]
+        for shortcode in automations.keys()
+    ]
+    await update.message.reply_text(
+        "Kaunsi automation hatani hai?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    shortcode = query.data.replace("rm_", "", 1)
+    admin_id = str(query.from_user.id)
+    data = load_data()
+
+    if admin_id in data and shortcode in data[admin_id]:
+        del data[admin_id][shortcode]
+        save_data(data)
+        await query.edit_message_text(f"✅ Hata diya: {shortcode}")
+    else:
+        await query.edit_message_text("Ye automation pehle se nahi mili (shayad already hata di gayi).")
+
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the current data.json to the admin, so it can be restored after a
+    Render restart (data.json itself is NOT persistent storage on Render)."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not os.path.exists(DATA_FILE):
+        await update.message.reply_text("Abhi tak koi data save nahi hua.")
+        return
+    with open(DATA_FILE, "rb") as f:
+        await update.message.reply_document(
+            document=InputFile(f, filename="data_backup.json"),
+            caption="Ye backup safe rakho. Restart ke baad /restore se wapas load kar sakte ho.",
+        )
+
+
+async def restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await update.message.reply_text("Backup ki gayi data_backup.json file yahan bhejo.")
+    return WAITING_RESTORE_FILE
+
+
+async def restore_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".json"):
+        await update.message.reply_text("Ye .json file nahi lagi. Sahi backup file bhejo, ya /cancel.")
+        return WAITING_RESTORE_FILE
+
+    tg_file = await doc.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+
+    try:
+        parsed = json.loads(file_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        await update.message.reply_text("File parse nahi ho payi, corrupt lag rahi hai.")
+        return ConversationHandler.END
+
+    save_data(parsed)
+    await update.message.reply_text("✅ Restore ho gaya! /list se check kar lo.")
+    return ConversationHandler.END
+
+
 def build_telegram_app():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
+    setup_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             WAITING_REEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reel_link)],
@@ -444,7 +607,21 @@ def build_telegram_app():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    application.add_handler(conv_handler)
+    restore_conv = ConversationHandler(
+        entry_points=[CommandHandler("restore", restore_start)],
+        states={
+            WAITING_RESTORE_FILE: [MessageHandler(filters.Document.ALL, restore_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    application.add_handler(setup_conv)
+    application.add_handler(restore_conv)
+    application.add_handler(CommandHandler("list", list_automations))
+    application.add_handler(CommandHandler("remove", remove_start))
+    application.add_handler(CommandHandler("backup", backup))
+    application.add_handler(CallbackQueryHandler(remove_confirm, pattern="^rm_"))
+
     return application
 
 
