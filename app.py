@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 BOT_TOKEN = "TELEGRAM_BOT_TOKEN_DALO"  # @BotFather se
 PAGE_ACCESS_TOKEN = "FB_PAGE_PERMANENT_TOKEN_DALO"
 IG_BUSINESS_ID = "1784..." # nrtecno2 ka IG Business ID
-VERIFY_TOKEN = "my_verify_token_123"
+VERIFY_TOKEN = "auto123"
 
 app = Flask(__name__)
 DATA_FILE = "data.json"
