@@ -3,6 +3,7 @@ import re
 import json
 import requests
 import asyncio
+import time
 from flask import Flask, request
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -220,7 +221,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             user_state[chat_id]["button_name"] = text
             user_state[chat_id]["step"] = "awaiting_button_url"
-            await update.message.reply_text(f"Button: {text}\nAb Button URL bhejo (same as DM link):")
+            await update.message.reply_text(f"Button: {text}\nAb Button URL bhejo:")
     elif step == "awaiting_button_url":
         if text.lower() == "skip":
             user_state[chat_id]["button_url"] = user_state[chat_id].get("dm_link", "")
@@ -245,24 +246,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(config)
         user_state.pop(chat_id, None)
         await update.message.reply_text(f"✅ Active!\nReel: {media_id}\nComment: {comment_text}")
-    elif step == "awaiting_cancel_link":
-        shortcode = extract_shortcode(text)
-        media_id = get_media_id_from_shortcode(shortcode) or shortcode
-        config = load_config()
-        deleted = False
-        if media_id in config:
-            del config[media_id]
-            deleted = True
-        for mid in list(config.keys()):
-            if config[mid].get("shortcode") == shortcode:
-                del config[mid]
-                deleted = True
-        if deleted:
-            save_config(config)
-            await update.message.reply_text("✅ Band kar diya!")
-        else:
-            await update.message.reply_text("❌ Nahi mili.")
-        user_state.pop(chat_id, None)
 
 async def run_telegram_async():
     if not TG_TOKEN:
@@ -276,7 +259,6 @@ async def run_telegram_async():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    # Keep running
     while True:
         await asyncio.sleep(3600)
 
@@ -290,9 +272,8 @@ def start_telegram_thread():
     loop.run_until_complete(run_telegram_async())
 
 if __name__ == "__main__":
-    # Flask in thread, Telegram in main with its own loop
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     time.sleep(2)
     start_telegram_thread()
-    
+                        
